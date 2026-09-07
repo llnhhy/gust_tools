@@ -1,6 +1,9 @@
 name: Windows
 
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
 
 env:
   PROJECT_NAME: gust_tools
@@ -20,7 +23,9 @@ jobs:
     - name: Set version
       shell: bash
       id: set_version
-      run: echo "version=$(git describe --tags --abbrev=0)" >> $GITHUB_OUTPUT
+      run: |
+        ver=$(git describe --tags --abbrev=0 2>/dev/null || echo "0.0.0")
+        echo "version=$ver" >> $GITHUB_OUTPUT
 
     - name: Add MSBuild to PATH
       uses: microsoft/setup-msbuild@v2
