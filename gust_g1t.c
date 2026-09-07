@@ -580,6 +580,80 @@ static void flip(uint32_t bits_per_pixel, uint8_t* buf, const uint32_t size, uin
     free(tmp_buf);
 }
 
+// ---------------------------------------------------------------------------
+// Tegra X1 block-linear (GOB) swizzle — needed for Nintendo Switch g1t files,
+// e.g. Atelier Ryza 1/2/3 DX.  The classic Morton swizzle used for PS4/PSV/3DS
+// does NOT match the Switch layout, which yields broken ("cut into vertical
+// strips") output.  This implements the same address scheme as Switch-Toolbox
+// (TegraX1Swizzle.cs) / BNTX (getAddrBlockLinear) / tegra_swizzle.
+// ---------------------------------------------------------------------------
+static uint32_t div_round_up(uint32_t n, uint32_t d) {
+    return (n + d - 1) / d;
+}
+
+// block_height for the base (mip 0) surface, in bytes-padding terms, from the
+// number of height blocks.  Derived from tegra_swizzle's block_height_mip0().
+static uint32_t block_height_mip0(uint32_t height_blocks) {
+    uint32_t hh = height_blocks + height_blocks / 2;
+    if (hh >= 128) return 16;
+    if (hh >= 64)  return 8;
+    if (hh >= 32)  return 4;
+    if (hh >= 16)  return 2;
+    return 1;
+}
+
+// block_height for a given mip level (halved while it fits), from its own
+// height block count and the mip0 block height.
+static uint32_t mip_block_height(uint32_t mip_height_blocks, uint32_t bh_mip0) {
+    uint32_t bh = bh_mip0;
+    while (mip_height_blocks <= (bh / 2) * 8 && bh > 1)
+        bh /= 2;
+    return bh;
+}
+
+// NVIDIA Tegra X1 block-linear address (getAddrBlockLinear), in bytes.
+// x,y are in *blocks* (each block is dds_bwh x dds_bwh pixels = bpp bytes).
+static uint32_t get_addr_block_linear(uint32_t x, uint32_t y, uint32_t image_width_blocks,
+                                      uint32_t bpp, uint32_t base_address, uint32_t block_height) {
+    uint32_t image_width_in_gobs = div_round_up(image_width_blocks * bpp, 64);
+    uint32_t GOB = base_address
+        + (y / (8 * block_height)) * 512 * block_height * image_width_in_gobs
+        + (x * bpp / 64) * 512 * block_height
+        + (y % (8 * block_height) / 8) * 512;
+    uint32_t xb = x * bpp;
+    return GOB + ((xb % 64) / 32) * 256 + ((y % 8) / 2) * 64
+        + ((xb % 32) / 16) * 32 + (y % 2) * 16 + (xb % 16);
+}
+
+// Reorder a single surface between linear block order and Tegra block-linear
+// (swizzled) order, in place.  deswizzle == true converts a swizzled buffer to
+// linear (used when extracting); false converts linear back to swizzled (used
+// when repacking).  buf must hold width_blocks*height_blocks*bpp bytes.
+static void tegra_blocklinear(const enum DDS_FORMAT format, uint32_t width_blocks,
+                              uint32_t height_blocks, uint32_t block_height,
+                              uint8_t* buf, bool deswizzle) {
+    const uint32_t bpp = dds_bpb(format);
+    const uint32_t total = width_blocks * height_blocks * bpp;
+    uint8_t* tmp_buf = (uint8_t*)malloc(total);
+    if (tmp_buf == NULL)
+        return;
+    for (uint32_t y = 0; y < height_blocks; y++) {
+        for (uint32_t x = 0; x < width_blocks; x++) {
+            uint32_t addr = get_addr_block_linear(x, y, width_blocks, bpp, 0, block_height);
+            uint32_t linear = (y * width_blocks + x) * bpp;
+            if (deswizzle) {
+                if (addr + bpp <= total && linear + bpp <= total)
+                    memcpy(&tmp_buf[linear], &buf[addr], bpp);
+            } else {
+                if (linear + bpp <= total && addr + bpp <= total)
+                    memcpy(&tmp_buf[addr], &buf[linear], bpp);
+            }
+        }
+    }
+    memcpy(buf, tmp_buf, total);
+    free(tmp_buf);
+}
+
 int main_utf8(int argc, char** argv)
 {
     int r = -1;
@@ -857,7 +931,7 @@ int main_utf8(int argc, char** argv)
 //            case 0x63: texture_format = DDS_FORMAT_BC4; swizzled = true; break;
 //            case 0x64: texture_format = DDS_FORMAT_BC5; swizzled = true; break;
 //            case 0x65: texture_format = DDS_FORMAT_BC6; swizzled = true; break;
-//            case 0x66: texture_format = DDS_FORMAT_BC7; swizzled = true; break;
+            case 0x66: texture_format = DDS_FORMAT_BC7; swizzled = true; break;
             case 0x72: texture_format = DDS_FORMAT_BC7; break;   // Win
             default:
                 fprintf(stderr, "ERROR: Unsupported texture type 0x%02x\n", tex.type);
@@ -919,7 +993,22 @@ int main_utf8(int argc, char** argv)
             if (flip_image || ((hdr.platform == NINTENDO_3DS) && (tex.type == 0x09 || tex.type == 0x45)))
                 flip(dds_bpp(texture_format), dds_payload, texture_size, dds_header->width);
 
-            if (swizzled) {
+            if (swizzled && hdr.platform == NINTENDO_SWITCH) {
+                // Nintendo Switch (e.g. Atelier Ryza 1/2/3 DX) uses a Tegra X1
+                // block-linear (GOB) layout, not the Morton swizzle below.
+                const uint32_t bwh = dds_bwh(texture_format);
+                uint32_t bh_mip0 = block_height_mip0(div_round_up(dds_header->height, bwh));
+                uint32_t offset = 0;
+                for (int j = 0; j < tex.mipmaps; j++) {
+                    uint32_t mw = dds_header->width / (1 << j); if (mw == 0) mw = 1;
+                    uint32_t mh = dds_header->height / (1 << j); if (mh == 0) mh = 1;
+                    uint32_t wb = div_round_up(mw, bwh), hb = div_round_up(mh, bwh);
+                    uint32_t bh = mip_block_height(hb, bh_mip0);
+                    uint32_t mipmap_size = MIPMAP_SIZE(texture_format, j, dds_header->width, dds_header->height);
+                    tegra_blocklinear(texture_format, wb, hb, bh, &dds_payload[offset], false);
+                    offset += mipmap_size;
+                }
+            } else if (swizzled) {
                 int16_t mo = 0;     // Morton order
                 uint32_t wf = 1;    // Width factor
                 uint32_t awf = 1;   // Additional width factor
@@ -1248,7 +1337,7 @@ int main_utf8(int argc, char** argv)
 //            case 0x63: texture_format = DDS_FORMAT_BC4; swizzled = true; break;
 //            case 0x64: texture_format = DDS_FORMAT_BC5; swizzled = true; break;
 //            case 0x65: texture_format = DDS_FORMAT_BC6; swizzled = true; break;
-//            case 0x66: texture_format = DDS_FORMAT_BC7; swizzled = true; break;
+            case 0x66: texture_format = DDS_FORMAT_BC7; swizzled = true; break;
             // 0x72 is not actually BC7, but that's the closest we get to semi-recognizable output
             case 0x72: texture_format = DDS_FORMAT_BC7; break;
             default:
@@ -1284,6 +1373,13 @@ int main_utf8(int argc, char** argv)
                 } else if (texture_size / expected_texture_size == 6) {
                     // A cubemap is composed of one texture for each face
                     flags[1] |= G1T_FLAG_CUBE_MAP;
+                } else if (hdr->platform == NINTENDO_SWITCH) {
+                    // Switch textures may carry trailing zero-padding up to a fixed
+                    // allocation size (e.g. tiny 4x4 single-mip entries).  That
+                    // padding is not image content, so clamp to the expected size.
+                    fprintf(stderr, "NOTE: Truncating %u bytes of padding in texture %u (0x%02x)\n",
+                        texture_size - expected_texture_size, i, tex->type);
+                    texture_size = expected_texture_size;
                 } else {
                     fprintf(stderr, "ERROR: Cube map with a factor of %d doesn't match our assertion\n",
                         texture_size / expected_texture_size);
@@ -1339,7 +1435,22 @@ int main_utf8(int argc, char** argv)
             // insist on using ARGB always...
             if (texture_format >= DDS_FORMAT_ABGR4 && texture_format <= DDS_FORMAT_RGBA8)
                 rgba_convert(texture_format, argb_name[texture_format], "ARGB", &buf[pos], expected_texture_size);
-            if (swizzled) {
+            if (swizzled && hdr->platform == NINTENDO_SWITCH) {
+                // Nintendo Switch (e.g. Atelier Ryza 1/2/3 DX) uses a Tegra X1
+                // block-linear (GOB) layout, not the Morton swizzle below.
+                const uint32_t bwh = dds_bwh(texture_format);
+                uint32_t bh_mip0 = block_height_mip0(div_round_up(height, bwh));
+                uint32_t offset = 0;
+                for (int j = 0; j < tex->mipmaps; j++) {
+                    uint32_t mw = width / (1 << j); if (mw == 0) mw = 1;
+                    uint32_t mh = height / (1 << j); if (mh == 0) mh = 1;
+                    uint32_t wb = div_round_up(mw, bwh), hb = div_round_up(mh, bwh);
+                    uint32_t bh = mip_block_height(hb, bh_mip0);
+                    uint32_t mipmap_size = max(MIPMAP_SIZE(texture_format, j, width, height), min_mipmap_size);
+                    tegra_blocklinear(texture_format, wb, hb, bh, &buf[pos + offset], true);
+                    offset += mipmap_size;
+                }
+            } else if (swizzled) {
                 int16_t mo = 0;     // Morton order
                 uint32_t wf = 1;    // Width factor
                 uint32_t awf = 1;   // Additional width factor
