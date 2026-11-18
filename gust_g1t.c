@@ -625,33 +625,42 @@ static uint32_t get_addr_block_linear(uint32_t x, uint32_t y, uint32_t image_wid
         + ((xb % 32) / 16) * 32 + (y % 2) * 16 + (xb % 16);
 }
 
+// Nintendo Switch (Tegra X1) allocates block-linear surfaces in GOB units of
+// 512 bytes, so the stored size of a surface is rounded up to a multiple of
+// 512 (e.g. a 4x4 BC7 surface holds 16 bytes of data but still occupies a
+// whole GOB).  This padding must be preserved when repacking, or the resulting
+// .g1t won't match the original file.
+#define TEGRA_GOB_SIZE 512u
+
+// Size, in bytes, occupied by a given mipmap of a Tegra block-linear surface.
+static uint32_t tegra_gob_size(const enum DDS_FORMAT format, uint32_t mip_level,
+                               uint32_t width, uint32_t height) {
+    const uint32_t size = MIPMAP_SIZE(format, mip_level, width, height);
+    return (size + TEGRA_GOB_SIZE - 1) / TEGRA_GOB_SIZE * TEGRA_GOB_SIZE;
+}
+
 // Reorder a single surface between linear block order and Tegra block-linear
-// (swizzled) order, in place.  deswizzle == true converts a swizzled buffer to
-// linear (used when extracting); false converts linear back to swizzled (used
-// when repacking).  buf must hold width_blocks*height_blocks*bpp bytes.
+// (swizzled) order.  deswizzle == true converts a swizzled buffer to linear
+// (used when extracting); false converts linear back to swizzled (used when
+// repacking).  src holds width_blocks*height_blocks*bpp bytes; dst must be at
+// least tegra_gob_size() bytes for that surface and is not otherwise touched.
 static void tegra_blocklinear(const enum DDS_FORMAT format, uint32_t width_blocks,
                               uint32_t height_blocks, uint32_t block_height,
-                              uint8_t* buf, bool deswizzle) {
+                              const uint8_t* src, uint8_t* dst, bool deswizzle) {
     const uint32_t bpp = dds_bpb(format);
     const uint32_t total = width_blocks * height_blocks * bpp;
-    uint8_t* tmp_buf = (uint8_t*)malloc(total);
-    if (tmp_buf == NULL)
-        return;
     for (uint32_t y = 0; y < height_blocks; y++) {
         for (uint32_t x = 0; x < width_blocks; x++) {
             uint32_t addr = get_addr_block_linear(x, y, width_blocks, bpp, 0, block_height);
             uint32_t linear = (y * width_blocks + x) * bpp;
-            if (deswizzle) {
-                if (addr + bpp <= total && linear + bpp <= total)
-                    memcpy(&tmp_buf[linear], &buf[addr], bpp);
-            } else {
-                if (linear + bpp <= total && addr + bpp <= total)
-                    memcpy(&tmp_buf[addr], &buf[linear], bpp);
-            }
+            if (linear + bpp > total)
+                continue;
+            if (deswizzle)
+                memcpy(&dst[linear], &src[addr], bpp);
+            else
+                memcpy(&dst[addr], &src[linear], bpp);
         }
     }
-    memcpy(buf, tmp_buf, total);
-    free(tmp_buf);
 }
 
 int main_utf8(int argc, char** argv)
@@ -940,10 +949,19 @@ int main_utf8(int argc, char** argv)
 
             uint32_t expected_texture_size = 0;
             uint32_t min_mipmap_size = dds_bpb(texture_format);
+            // Size of one frame as stored in the DDS (never padded) and as
+            // stored in the .g1t (Switch pads each block-linear surface to a
+            // whole GOB).
+            uint32_t dds_frame_size = 0, stored_frame_size = 0;
             if (hdr.platform == NINTENDO_WIIU)
                 min_mipmap_size = 0x40 * dds_bpb(texture_format);
-            for (int j = 0; j < tex.mipmaps; j++)
-                expected_texture_size += MIPMAP_SIZE(texture_format, j, dds_header->width, dds_header->height);
+            for (int j = 0; j < tex.mipmaps; j++) {
+                uint32_t mipmap_size = MIPMAP_SIZE(texture_format, j, dds_header->width, dds_header->height);
+                dds_frame_size += mipmap_size;
+                stored_frame_size += (swizzled && hdr.platform == NINTENDO_SWITCH) ?
+                    tegra_gob_size(texture_format, j, dds_header->width, dds_header->height) : mipmap_size;
+                expected_texture_size += mipmap_size;
+            }
             expected_texture_size *= nb_frames;
             bool cubemap = dds_header->caps & DDS_SURFACE_FLAGS_CUBEMAP && dds_header->caps2 & DDS_CUBEMAP_ALLFACES;
             if (cubemap) {
@@ -993,22 +1011,7 @@ int main_utf8(int argc, char** argv)
             if (flip_image || ((hdr.platform == NINTENDO_3DS) && (tex.type == 0x09 || tex.type == 0x45)))
                 flip(dds_bpp(texture_format), dds_payload, texture_size, dds_header->width);
 
-            if (swizzled && hdr.platform == NINTENDO_SWITCH) {
-                // Nintendo Switch (e.g. Atelier Ryza 1/2/3 DX) uses a Tegra X1
-                // block-linear (GOB) layout, not the Morton swizzle below.
-                const uint32_t bwh = dds_bwh(texture_format);
-                uint32_t bh_mip0 = block_height_mip0(div_round_up(dds_header->height, bwh));
-                uint32_t offset = 0;
-                for (int j = 0; j < tex.mipmaps; j++) {
-                    uint32_t mw = dds_header->width / (1 << j); if (mw == 0) mw = 1;
-                    uint32_t mh = dds_header->height / (1 << j); if (mh == 0) mh = 1;
-                    uint32_t wb = div_round_up(mw, bwh), hb = div_round_up(mh, bwh);
-                    uint32_t bh = mip_block_height(hb, bh_mip0);
-                    uint32_t mipmap_size = MIPMAP_SIZE(texture_format, j, dds_header->width, dds_header->height);
-                    tegra_blocklinear(texture_format, wb, hb, bh, &dds_payload[offset], false);
-                    offset += mipmap_size;
-                }
-            } else if (swizzled) {
+            if (swizzled && hdr.platform != NINTENDO_SWITCH) {
                 int16_t mo = 0;     // Morton order
                 uint32_t wf = 1;    // Width factor
                 uint32_t awf = 1;   // Additional width factor
@@ -1052,6 +1055,36 @@ int main_utf8(int argc, char** argv)
             if (texture_format >= DDS_FORMAT_ABGR4 && texture_format <= DDS_FORMAT_RGBA8)
                 rgba_convert(texture_format, "ARGB", argb_name[texture_format], dds_payload, texture_size);
 
+            // Nintendo Switch (e.g. Atelier Ryza 1/2/3 DX) uses a Tegra X1
+            // block-linear (GOB) layout, not the Morton swizzle above.  Each
+            // surface is stored GOB-aligned (i.e. padded), so the swizzled
+            // payload is built in its own zero-initialized buffer.
+            const uint8_t* stored = dds_payload;
+            uint8_t* stored_buf = NULL;
+            if (swizzled && hdr.platform == NINTENDO_SWITCH) {
+                const uint32_t bwh = dds_bwh(texture_format);
+                const uint32_t bh_mip0 = block_height_mip0(div_round_up(dds_header->height, bwh));
+                const uint32_t nb_surfaces = nb_frames * (cubemap ? 6 : 1);
+                stored_buf = (uint8_t*)calloc(nb_surfaces * stored_frame_size, 1);
+                if (stored_buf == NULL) {
+                    fprintf(stderr, "ERROR: Alloc error\n");
+                    goto out;
+                }
+                for (uint32_t f = 0; f < nb_surfaces; f++) {
+                    uint32_t dds_offset = 0, stored_offset = 0;
+                    for (int j = 0; j < tex.mipmaps; j++) {
+                        uint32_t wb = div_round_up(max(1u, dds_header->width / (1 << j)), bwh);
+                        uint32_t hb = div_round_up(max(1u, dds_header->height / (1 << j)), bwh);
+                        tegra_blocklinear(texture_format, wb, hb, mip_block_height(hb, bh_mip0),
+                            &dds_payload[f * dds_frame_size + dds_offset],
+                            &stored_buf[f * stored_frame_size + stored_offset], false);
+                        dds_offset += MIPMAP_SIZE(texture_format, j, dds_header->width, dds_header->height);
+                        stored_offset += tegra_gob_size(texture_format, j, dds_header->width, dds_header->height);
+                    }
+                }
+                stored = stored_buf;
+            }
+
             char dims[16] = { 0 }, props[8] = { 0 };
             snprintf(dims, sizeof(dims), "%dx%d", dds_header->width, dds_header->height);
             if (nb_frames > 1)
@@ -1072,14 +1105,19 @@ int main_utf8(int argc, char** argv)
                 nb_frames *= 6;     // Adjust effective nb_frames for cubemaps
             // Inverse operation from the one we carry when extracting DDS
             uint32_t f_size = texture_size / nb_frames;
-            for (uint32_t l = 0, offset = 0; l < tex.mipmaps; l++) {
+            for (uint32_t l = 0, offset = 0, stored_offset = 0; l < tex.mipmaps; l++) {
                 uint32_t mipmap_size = MIPMAP_SIZE(texture_format, l, dds_header->width, dds_header->height);
+                // Block-linear Switch surfaces are stored GOB-aligned, padding included
+                uint32_t write_size = (swizzled && hdr.platform == NINTENDO_SWITCH) ?
+                    tegra_gob_size(texture_format, l, dds_header->width, dds_header->height) : mipmap_size;
                 for (uint32_t f = 0; f < nb_frames; f++) {
-                    if (fwrite(&dds_payload[f * f_size + offset], mipmap_size, 1, file) != 1) {
+                    const uint8_t* src = (swizzled && hdr.platform == NINTENDO_SWITCH) ?
+                        &stored[f * stored_frame_size + stored_offset] : &dds_payload[f * f_size + offset];
+                    if (fwrite(src, write_size, 1, file) != 1) {
                         fprintf(stderr, "ERROR: Can't write DDS data\n");
                         goto out;
                     }
-                    if (mipmap_size < min_mipmap_size) {
+                    if ((!(swizzled && hdr.platform == NINTENDO_SWITCH)) && (mipmap_size < min_mipmap_size)) {
                         uint8_t* completion_buf = calloc(min_mipmap_size - mipmap_size, 1);
                         if (completion_buf == NULL)
                             goto out;
@@ -1091,7 +1129,9 @@ int main_utf8(int argc, char** argv)
                     }
                 }
                 offset += mipmap_size;
+                stored_offset += write_size;
             }
+            free(stored_buf);
             free(buf);
             buf = NULL;
         }
@@ -1349,8 +1389,12 @@ int main_utf8(int argc, char** argv)
             uint32_t min_mipmap_size = dds_bpb(texture_format);
             if (hdr->platform == NINTENDO_WIIU)
                 min_mipmap_size = 0x40 * dds_bpb(texture_format);
-            for (int j = 0; j < tex->mipmaps; j++)
-                expected_texture_size += nb_frames * max(MIPMAP_SIZE(texture_format, j, width, height), min_mipmap_size);
+            for (int j = 0; j < tex->mipmaps; j++) {
+                if (swizzled && hdr->platform == NINTENDO_SWITCH)    // GOB-aligned surfaces
+                    expected_texture_size += nb_frames * tegra_gob_size(texture_format, j, width, height);
+                else
+                    expected_texture_size += nb_frames * max(MIPMAP_SIZE(texture_format, j, width, height), min_mipmap_size);
+            }
             uint32_t texture_size = ((i + 1 == hdr->nb_textures) ?
                 g1t_size - hdr->header_size : getv32(x_offset_table[i + 1])) - getv32(x_offset_table[i]);
             texture_size -= (uint32_t)sizeof(g1t_tex_header);
@@ -1373,13 +1417,6 @@ int main_utf8(int argc, char** argv)
                 } else if (texture_size / expected_texture_size == 6) {
                     // A cubemap is composed of one texture for each face
                     flags[1] |= G1T_FLAG_CUBE_MAP;
-                } else if (hdr->platform == NINTENDO_SWITCH) {
-                    // Switch textures may carry trailing zero-padding up to a fixed
-                    // allocation size (e.g. tiny 4x4 single-mip entries).  That
-                    // padding is not image content, so clamp to the expected size.
-                    fprintf(stderr, "NOTE: Truncating %u bytes of padding in texture %u (0x%02x)\n",
-                        texture_size - expected_texture_size, i, tex->type);
-                    texture_size = expected_texture_size;
                 } else {
                     fprintf(stderr, "ERROR: Cube map with a factor of %d doesn't match our assertion\n",
                         texture_size / expected_texture_size);
@@ -1445,10 +1482,15 @@ int main_utf8(int argc, char** argv)
                     uint32_t mw = width / (1 << j); if (mw == 0) mw = 1;
                     uint32_t mh = height / (1 << j); if (mh == 0) mh = 1;
                     uint32_t wb = div_round_up(mw, bwh), hb = div_round_up(mh, bwh);
-                    uint32_t bh = mip_block_height(hb, bh_mip0);
-                    uint32_t mipmap_size = max(MIPMAP_SIZE(texture_format, j, width, height), min_mipmap_size);
-                    tegra_blocklinear(texture_format, wb, hb, bh, &buf[pos + offset], true);
-                    offset += mipmap_size;
+                    uint32_t mipmap_size = MIPMAP_SIZE(texture_format, j, width, height);
+                    uint8_t* mipmap_buf = (uint8_t*)malloc(mipmap_size);
+                    if (mipmap_buf == NULL)
+                        goto out;
+                    tegra_blocklinear(texture_format, wb, hb, mip_block_height(hb, bh_mip0),
+                        &buf[pos + offset], mipmap_buf, true);
+                    memcpy(&buf[pos + offset], mipmap_buf, mipmap_size);
+                    free(mipmap_buf);
+                    offset += tegra_gob_size(texture_format, j, width, height);
                 }
             } else if (swizzled) {
                 int16_t mo = 0;     // Morton order
@@ -1493,7 +1535,9 @@ int main_utf8(int argc, char** argv)
                 nb_frames *= 6;     // Adjust effective nb_frames for cubemaps
             for (uint32_t f = 0; f < nb_frames; f++) {
                 for (uint32_t l = 0, offset = 0; l < tex->mipmaps; l++) {
-                    uint32_t mipmap_size = max(MIPMAP_SIZE(texture_format, l, width, height), min_mipmap_size);
+                    uint32_t mipmap_size = (swizzled && hdr->platform == NINTENDO_SWITCH) ?
+                        tegra_gob_size(texture_format, l, width, height) :
+                        max(MIPMAP_SIZE(texture_format, l, width, height), min_mipmap_size);
                     offset += f * mipmap_size;
                     if (fwrite(&buf[pos + offset], MIPMAP_SIZE(texture_format, l, width, height), 1, dst) != 1) {
                         fprintf(stderr, "ERROR: Can't write DDS data\n");

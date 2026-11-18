@@ -40,7 +40,8 @@ set list=^
   type_5f_win_4^
   type_60_ps4^
   type_62_ps4^
-  type_62_ps4_2
+  type_62_ps4_2^
+  type_66_sw
 
 for %%a in (%list%) do (
   if exist %%a.%EXT%.bak move /y %%a.%EXT%.bak %%a.%EXT% >NUL 2>&1
